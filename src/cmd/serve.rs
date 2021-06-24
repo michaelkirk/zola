@@ -65,6 +65,64 @@ enum WatchMode {
     Condition(bool),
 }
 
+struct RangeRequest {
+    // TODO: `start` can also be None for a suffix request
+    start: u64,
+    end: Option<u64>,
+}
+
+impl RangeRequest {
+    fn from_header_str(header_str: &str) -> Result<Self> {
+        if let Some(bytes) = header_str.strip_prefix("bytes=") {
+            if let Some((start_str, end_str)) = bytes.split_once("-") {
+                match (start_str.parse(), end_str.parse()) {
+                    (Ok(start), Ok(end)) => {
+                        println!("parsed range: {}-{}", start, end);
+                        return Ok(Self { start, end: Some(end) })
+                    }
+                    (Ok(start), Err(end_err)) => {
+                        println!("parsed open ended range: {}-{:?}", start, end_err);
+                        return Ok(Self { start, end: None })
+                    }
+                    (Err(start_err), Ok(_end)) => {
+                        println!("parsing failed suffix request not supported - start: {:?}", start_err);
+                    }
+                    (Err(start_err), Err(end_err)) => {
+                        println!("parsing failed - start: {:?}, end: {:?}", start_err, end_err);
+                    }
+                }
+            } else {
+                println!("split failed");
+            }
+        } else {
+            println!("missing prefix");
+        }
+
+        panic!("invalid header");
+    }
+
+    async fn read(&self, root: &Path) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncSeekExt, AsyncReadExt};
+
+        let mut file = tokio::fs::File::open(root).await?;
+        if self.start > 0 {
+            file.seek(std::io::SeekFrom::Start(self.start)).await?;
+        }
+        if let Some(range_end) = self.end {
+            let mut contents = vec![0; (range_end - self.start + 1) as usize];
+            let read_size = file.read_exact(&mut contents).await?;
+            contents.resize(read_size, 0);
+            println!("read {} bytes for closed range", contents.len());
+            Ok(contents)
+        } else {
+            let mut contents = vec![];
+            file.read_to_end(&mut contents).await?;
+            println!("read {} bytes for open ended range", contents.len());
+            Ok(contents)
+        }
+    }
+}
+
 static METHOD_NOT_ALLOWED_TEXT: &[u8] = b"Method Not Allowed";
 static NOT_FOUND_TEXT: &[u8] = b"Not Found";
 
@@ -117,7 +175,26 @@ async fn handle_request(req: Request<Body>, mut root: PathBuf) -> Result<Respons
         root.push("index.html");
     };
 
-    let result = tokio::fs::read(&root).await;
+    let range: Option<RangeRequest> = req.headers().get("Range").and_then(|range_header| {
+        let range_header_str = range_header.to_str().unwrap();
+        RangeRequest::from_header_str(range_header_str).ok()
+    });
+
+    enum Content {
+        // content bytes
+        Full(Vec<u8>),
+        // requested range, content bytes, file length
+        Partial(RangeRequest, Vec<u8>, u64),
+    }
+
+    let result: std::io::Result<Content> = match range {
+        None => tokio::fs::read(&root).await.map(Content::Full),
+        Some(range) => {
+            let bytes = range.read(&root).await?;
+            let filesize = tokio::fs::metadata(&root).await?.len();
+            Ok(Content::Partial(range, bytes, filesize))
+        }
+    };
 
     let contents = match result {
         Err(err) => match err.kind() {
@@ -133,15 +210,26 @@ async fn handle_request(req: Request<Body>, mut root: PathBuf) -> Result<Respons
         Ok(contents) => contents,
     };
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
+    let builder = Response::builder()
         .header(
             header::CONTENT_TYPE,
             mimetype_from_path(&root).first_or_octet_stream().essence_str(),
-        )
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(Body::from(contents))
-        .unwrap())
+        ).header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+
+    Ok(match contents {
+        Content::Full(bytes) => {
+            builder.status(StatusCode::OK).body(Body::from(bytes)).unwrap()
+        }
+        Content::Partial(range, bytes, filesize) => {
+            let content_range = format!("bytes {}-{}/{}", range.start, range.start + bytes.len() as u64 - 1, filesize);
+
+            builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_RANGE, content_range)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Body::from(bytes)).unwrap()
+        }
+    })
 }
 
 fn livereload_js() -> Response<Body> {
